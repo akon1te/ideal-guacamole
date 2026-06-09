@@ -1,29 +1,3 @@
-"""FSODE improvements — new architectures for the Continuously-Stable ODE family.
-
-Implements the architectural ideas from `plans/csode_improvements.md`:
-
-  * `csode_diag`     — Idea 2: per-dimension diagonal gamma vector
-                       f(y) = -diag(softplus(γ)) · y + MLP(y),  γ ∈ R^d
-  * `csode_full`     — Idea 1: state-dependent contraction matrix A(y)
-                       (Manek & Kolter 2019)
-                       f(y) = A(y)·y + g(y),
-                       A(y) = -exp(α)·I - W(y)ᵀW(y),  W(y) ∈ R^{r×d}
-  * `csode_res`      — Idea 7: residual blocks in the free MLP + outer contraction
-                       f(y) = -softplus(γ)·y + ResStack(y)
-  * `csode_statedep` — Idea 10: state-dependent γ(y)
-                       γ(y) = softplus(MLP_small(y)) ∈ R^d
-                       f(y) = -diag(γ(y))·y + MLP_main(y)
-
-All wrappers follow the same calling convention as the existing
-`CSODE` / `ANODE` / `HNODE` in `models.py`:
-    model(y0, t_grid) -> (B, T-1, dim)
-using the fixed-step RK4 integrator copied from `models.py` for parity.
-
-The augmented-state contract matches the rest of the codebase:
-  * `total_dim = dim + aug`
-  * zeros are appended to `y0` to produce the augmented initial state
-  * only the first `dim` channels of the trajectory are returned
-"""
 from __future__ import annotations
 
 import torch

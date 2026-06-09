@@ -1,26 +1,3 @@
-"""validate_csode.py — re-validate CSODE *variant* checkpoints.
-
-The shared [`validate.py`](validate.py:1) calls
-[`models.build_model()`](models.py:728) directly and crashes with
-`ValueError: Unknown model_type: csode_*` for any of the 8 Phase-2/3
-variant names (csode_diag, csode_full, csode_res, csode_statedep,
-csode_icnn_lyap, csode_contract, csode_hnn, csode_icnn_grad).
-
-This wrapper monkey-patches:
-    * `models.build_model`  — dispatch to `build_csode_variant{,_phase3}`
-    * `models.ODE_MODELS`   — extended with the variant names
-
-then `runpy`s `validate.py` so all metrics (T_valid, W1, sym_KL, spec_L1,
-plots, *_metrics.json) get produced.
-
-Variant constructor kwargs default to the values used in the actual
-training runs (see [`experiments/run_csode_all_parallel.sh`](experiments/run_csode_all_parallel.sh:57)
-and [`experiments/run_csode_phase3.sh`](experiments/run_csode_phase3.sh:67)).
-
-Usage
------
-    python validate_csode.py --ckpt checkpoints/rossler_P2_csode_diag/rossler_csode_diag.pt
-"""
 from __future__ import annotations
 
 import runpy

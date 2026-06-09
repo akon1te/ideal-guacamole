@@ -1,23 +1,4 @@
-"""
-Train Neural ODE / ANODE / WP-NODE / CSODE / HNODE / MLP / RNN on a dynamical
-system trajectory.
 
-Features
---------
-* Curriculum learning: progressively grows the training horizon
-  (5 -> 15 -> 30 -> 50 steps) over the epochs.
-* Composite loss: MSE + lambda_jac * Jacobian-Hutchinson + lambda_kin * kinetic
-  + lambda_spec * spectral (FFT power-spectrum L1) for HNODE.
-* All NODE-family models share the same RK4 integrator for fair comparison.
-
-Usage:
-    python train.py --system rossler        --model node
-    python train.py --system hindmarsh_rose --model hnode --curriculum
-    python train.py --system quasi_periodic --model wpnode --lambda_jac 0.01
-
-Defaults are chosen to reproduce the previous baseline behaviour (no curriculum,
-no regularization) when those flags are not set.
-"""
 import argparse
 import os
 import sys
