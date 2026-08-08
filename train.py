@@ -10,8 +10,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from systems import generate, SYSTEMS
-from models import build_model, REGULARIZED_MODELS, ODE_MODELS
+from src.dynsys.data import (
+    SYSTEMS,
+    apply_training_constraints,
+    generate,
+    make_windows,
+    normalise_train_validation,
+    split_trajectory,
+)
+from src.dynsys.models.registry import (
+    available_model_names,
+    build_model,
+    ode_model_names,
+    regularized_model_names,
+)
 
 
 class Tee:
@@ -30,11 +42,7 @@ class Tee:
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--system", choices=list(SYSTEMS), default="rossler")
-parser.add_argument("--model",
-                    choices=["node", "anode", "wpnode", "csode",
-                             "hnode", "tnode", "rnode", "snode", "lnode",
-                             "mnode", "fnode", "fnode_v2", "mlp", "rnn"],
-                    default="node")
+parser.add_argument("--model", choices=available_model_names(), default="node")
 parser.add_argument("--seq_len", type=int,   default=50)
 parser.add_argument("--hidden",  type=int,   default=64)
 parser.add_argument("--aug",     type=int,   default=2,  help="augmentation dims (ANODE/HNODE)")
@@ -105,8 +113,20 @@ parser.add_argument("--cosine_lr", action="store_true",
                     help="enable cosine LR decay from --lr to lr*0.01")
 parser.add_argument("--warmup_epochs", type=int, default=0,
                     help="linear LR warmup duration; only used with --cosine_lr.")
-parser.add_argument("--gamma_init", type=float, default=0.1,
-                    help="initial diagonal value for KCNode matrix A")
+parser.add_argument("--fnode_rank", type=int, default=None,
+                    help="rank of FNODE's state-dependent contraction factor")
+parser.add_argument("--fnode_hidden_w", type=int, default=16,
+                    help="hidden width of FNODE's contraction-factor network")
+parser.add_argument("--fnode_alpha_init", type=float, default=-2.25,
+                    help="initial log isotropic decay for FNODE")
+parser.add_argument("--csode_layers", type=int, default=3,
+                    help="depth of CSODE's time-conditioned main MLP")
+parser.add_argument("--csode_control_hidden", type=int, default=None,
+                    help="hidden width of CSODE control networks; default=--hidden")
+parser.add_argument("--csode_control_layers", type=int, default=1,
+                    help="depth of CSODE's time-conditioned auxiliary network")
+parser.add_argument("--csode_solver", choices=["rk4", "euler"], default="rk4",
+                    help="CSODE integration method; use euler to reproduce the paper's solver")
 
 
 # === Robustness experiments ===============================================
@@ -151,40 +171,37 @@ y_np = y_np.astype(np.float32)
 dim = y_np.shape[1]
 dt  = float(t_np[1] - t_np[0])
 
-mean, std = y_np.mean(0), y_np.std(0)
-y_norm = (y_np - mean) / std
+y_train_raw, y_val_raw, _ = split_trajectory(y_np)
+full_train_steps = len(y_train_raw)
 
-# 80/20 split, then sliding-window pairs (y[t], y[t+1..t+seq_len])
-def windows(arr, L):
-    X, Y = [], []
-    for i in range(len(arr) - L):
-        X.append(arr[i])
-        Y.append(arr[i + 1 : i + 1 + L])
-    return torch.tensor(np.array(X)), torch.tensor(np.array(Y))
-
-
-split = int(len(y_norm) * 0.8)
-y_train_full = y_norm[:split]
-y_val_full   = y_norm[split:]
-
-# C2: low-data — take a contiguous prefix of the training half ===========
+# C2: restrict the available raw training prefix before fitting normalization
+# statistics.  A low-data run must not observe the withheld train remainder.
 if args.data_frac < 1.0:
-    n_keep = max(args.seq_len + 2, int(round(len(y_train_full) * args.data_frac)))
-    n_keep = min(n_keep, len(y_train_full))
-    print(f"data_frac={args.data_frac:.3f} -> using {n_keep}/{len(y_train_full)} "
-          f"training timesteps (~{n_keep/len(y_train_full)*100:.1f}%)")
-    y_train_full = y_train_full[:n_keep]
+    requested_keep = max(args.seq_len + 2, int(round(full_train_steps * args.data_frac)))
+    n_keep = min(requested_keep, full_train_steps)
+    print(f"data_frac={args.data_frac:.3f} -> using {n_keep}/{full_train_steps} "
+          f"training timesteps (~{n_keep/full_train_steps*100:.1f}%)")
+y_train_raw, _ = apply_training_constraints(
+    y_train_raw, args.seq_len, data_fraction=args.data_frac,
+    data_noise=0.0, seed=args.seed,
+)
 
-# C1: measurement noise on TRAIN ONLY ====================================
+y_train_full, y_val_full, mean, std = normalise_train_validation(
+    y_train_raw, y_val_raw,
+)
+
+# C1: add noise after normalisation, so sigma remains a fraction of the
+# standard deviation of the actually available training trajectory.
 if args.data_noise > 0:
-    rng = np.random.RandomState(args.seed)
-    y_train_full = (y_train_full
-                    + args.data_noise * rng.randn(*y_train_full.shape).astype(np.float32))
+    y_train_full, _ = apply_training_constraints(
+        y_train_full, args.seq_len, data_fraction=1.0,
+        data_noise=args.data_noise, seed=args.seed,
+    )
     print(f"data_noise={args.data_noise:.3f} sigma added to training trajectory "
           f"(in normalised units, validation kept clean)")
 
-X_tr, Y_tr = windows(y_train_full, args.seq_len)
-X_va, Y_va = windows(y_val_full,   args.seq_len)
+X_tr, Y_tr = make_windows(y_train_full, args.seq_len)
+X_va, Y_va = make_windows(y_val_full,   args.seq_len)
 print(f"#train_windows={len(X_tr)}  #val_windows={len(X_va)}")
 
 train_loader = DataLoader(TensorDataset(X_tr, Y_tr), batch_size=args.batch, shuffle=True)
@@ -305,7 +322,16 @@ def compute_tvalid(model, y_full_norm, dt, threshold=1.0,
 
 
 # === Model =================================================================
-base_model = build_model(args.model, dim, args.hidden, args.seq_len, aug=args.aug).to(device)
+base_model = build_model(
+    args.model, dim, args.hidden, args.seq_len, aug=args.aug,
+    fnode_rank=args.fnode_rank,
+    fnode_hidden_w=args.fnode_hidden_w,
+    fnode_alpha_init=args.fnode_alpha_init,
+    csode_layers=args.csode_layers,
+    csode_control_hidden=args.csode_control_hidden,
+    csode_control_layers=args.csode_control_layers,
+    csode_solver=args.csode_solver,
+).to(device)
 model = torch.compile(base_model) if args.compile else base_model
 opt     = torch.optim.Adam(base_model.parameters(), lr=args.lr)
 mse_fn  = nn.MSELoss()
@@ -356,8 +382,8 @@ if args.cosine_lr:
 else:
     scheduler = None
 
-is_ode = args.model in ODE_MODELS
-is_reg = args.model in REGULARIZED_MODELS
+is_ode = args.model in ode_model_names()
+is_reg = args.model in regularized_model_names()
 
 best_val, best_state = float("inf"), None
 history = {"train": [], "val": [], "horizon": []}
@@ -514,7 +540,7 @@ for epoch in range(1, args.epochs + 1):
     tvalid_str = ""
     if do_tvalid:
         tvalid, vsteps = compute_tvalid(
-            model, y_norm[split:], dt,
+            model, y_val_full, dt,
             threshold=args.tvalid_threshold,
             max_steps=args.tvalid_max_steps,
             is_ode=is_ode,
@@ -546,4 +572,6 @@ torch.save({
 }, path)
 print(f"\nSaved -> {path}  best_val={best_val:.5f}")
 print(f"Log    -> {log_path}")
+sys.stdout = sys.__stdout__
+sys.stderr = sys.__stderr__
 log_file.close()

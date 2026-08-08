@@ -1,0 +1,22 @@
+# Frozen reference protocol for comparisons during the refactor.
+# Existing checkpoints remain the historical baseline; new runs should use
+# this configuration (or a documented derivative) for comparable budgets.
+experiment: legacy_v1
+seed: 0
+systems: [rossler, hindmarsh_rose, quasi_periodic]
+models: [mlp, rnn, node, anode, csode, fnode]
+data:
+  normalisation: train_only_per_component_zscore
+  train_fraction: 0.8
+  generated_with: RK45
+  solver_rtol: 1.0e-9
+  solver_atol: 1.0e-9
+training:
+  hidden: 64
+  batch: 256
+  learning_rate: 0.001
+  epochs: 1000
+evaluation:
+  rollout: autoregressive_one_step
+  t_valid_threshold_sigma: 1.0
+  metrics: [rmse, mae, t_valid, spectral_l1, wasserstein_1, symmetric_kl]

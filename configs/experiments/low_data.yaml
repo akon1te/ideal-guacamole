@@ -1,0 +1,4 @@
+experiment: low_data_v1
+extends: clean_baseline_v1
+data_fractions: [0.05, 0.10, 0.20, 0.50, 1.00]
+note: Use a contiguous prefix of the normalized training trajectory only.

@@ -1,0 +1,18 @@
+experiment: clean_baseline_v1
+systems: [rossler, hindmarsh_rose, quasi_periodic]
+models: [mlp, rnn, node, anode, csode, fnode]
+seeds: [0, 1, 2]
+data:
+  train_fraction: 0.8
+  normalisation: train_only_per_component_zscore
+  data_fraction: 1.0
+  data_noise: 0.0
+training:
+  hidden: 64
+  batch: 256
+  learning_rate: 0.001
+  epochs: 1000
+evaluation:
+  rollout: autoregressive_one_step
+  t_valid_threshold_sigma: 1.0
+  solver_policy: rk4_for_all_ode_models

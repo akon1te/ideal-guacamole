@@ -20,8 +20,16 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 
-from systems import generate
-from models import build_model, ODE_MODELS
+from src.dynsys.data import generate
+from src.dynsys.evaluation.dynamics_metrics import (
+    autocorrelation_1d,
+    autocorrelation_distance,
+    boundedness_metrics,
+    dominant_frequency,
+    finite_time_divergence_rate,
+    phase_space_chamfer,
+)
+from src.dynsys.models.registry import build_model, ode_model_names
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--ckpt",  required=True)
@@ -31,6 +39,16 @@ parser.add_argument("--split", type=float, default=0.8,
                     help="Train/val split fraction used during training (visual marker).")
 parser.add_argument("--bins",  type=int,   default=50,
                     help="Histogram bins for KL divergence estimation.")
+parser.add_argument("--acf_lags", type=int, default=100,
+                    help="Maximum lag for autocorrelation comparison.")
+parser.add_argument("--phase_samples", type=int, default=2000,
+                    help="Maximum deterministic samples for phase-space Chamfer distance.")
+parser.add_argument("--bound_pad", type=float, default=0.05,
+                    help="Relative padding around the truth range for boundedness checks.")
+parser.add_argument("--divergence_points", type=int, default=2000,
+                    help="Maximum samples for finite-time divergence-rate estimation.")
+parser.add_argument("--divergence_steps", type=int, default=20,
+                    help="Number of future steps used by the finite-time divergence fit.")
 args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,25 +57,16 @@ cfg  = ckpt["args"]
 mean, std, dim, dt = ckpt["mean"], ckpt["std"], ckpt["dim"], ckpt["dt"]
 system, model_type, hidden, seq_len = cfg["system"], cfg["model"], cfg["hidden"], cfg["seq_len"]
 aug = cfg.get("aug", 2)
-use_control = cfg.get("use_control", False)
-
-# Optional resnode knobs — read from saved cfg with safe defaults so older
-# checkpoints (which lack these keys) keep loading.
-resnode_kwargs = {
-    "use_nonlinear":  cfg.get("use_nonlinear", False),
-    "encode_aug":     not cfg.get("no_encode_aug", False),
-    "init_decay":     cfg.get("init_decay", 0.05),
-    "skew_scale":     cfg.get("skew_scale", 1.0),
-    "sym_scale":      cfg.get("sym_scale", 0.1),
-    "hidden_corr":    cfg.get("hidden_corr", 32),
-    "hidden_ctrl":    cfg.get("hidden_ctrl", 32),
-    "hidden_enc":     cfg.get("hidden_enc", 32),
-    "resnode_solver": cfg.get("resnode_solver", "dopri5"),
-}
-
-model = build_model(model_type, dim, hidden, seq_len, aug=aug,
-                    use_control=use_control,
-                    **(resnode_kwargs if model_type == "resnode" else {})).to(device)
+model = build_model(
+    model_type, dim, hidden, seq_len, aug=aug,
+    fnode_rank=cfg.get("fnode_rank", None),
+    fnode_hidden_w=cfg.get("fnode_hidden_w", 16),
+    fnode_alpha_init=cfg.get("fnode_alpha_init", -2.25),
+    csode_layers=cfg.get("csode_layers", 3),
+    csode_control_hidden=cfg.get("csode_control_hidden", None),
+    csode_control_layers=cfg.get("csode_control_layers", 1),
+    csode_solver=cfg.get("csode_solver", "rk4"),
+).to(device)
 model.load_state_dict(ckpt["model_state"]); model.eval()
 
 # === Ground truth ==========================================================
@@ -66,7 +75,7 @@ y_np = y_np.astype(np.float32)
 y_norm = (y_np - mean) / std
 
 # === Autoregressive rollout (1-step at a time) =============================
-if model_type in ODE_MODELS:
+if model_type in ode_model_names():
     t_grid = torch.tensor([0.0, dt], device=device)
 else:
     t_grid = torch.linspace(0, dt * seq_len, seq_len + 1).to(device)
@@ -201,11 +210,37 @@ def burst_stats(x_signal, dt, threshold=0.0, min_gap_steps=10):
 
 
 # === Compute distributional metrics on val region ==========================
-v0 = split_idx
+# A short diagnostic rollout can end before the validation boundary.  In that
+# case use its available region rather than passing an empty array to FFT and
+# distribution metrics; full experiment runs still score validation only.
 v1 = n_steps + 1
+v0 = split_idx if split_idx < v1 else 0
+if v0 == 0 and split_idx >= v1:
+    print("  note: rollout ends before validation split; dynamic metrics use "
+          "the available rollout region.")
 spec_d = spectral_distance(preds_norm[v0:v1], y_norm[v0:v1])
 wd_mean, wd_per = wasserstein_1d(preds_norm[v0:v1], y_norm[v0:v1])
 kl_mean, kl_per = kl_hist_1d(preds_norm[v0:v1], y_norm[v0:v1], bins=args.bins)
+acf_mean, acf_per = autocorrelation_distance(
+    preds_norm[v0:v1], y_norm[v0:v1], max_lags=args.acf_lags,
+)
+dominant_pred = dominant_frequency(preds_norm[v0:v1], dt)
+dominant_true = dominant_frequency(y_norm[v0:v1], dt)
+dominant_error = np.abs(np.asarray(dominant_pred) - np.asarray(dominant_true))
+phase_chamfer = phase_space_chamfer(
+    preds_norm[v0:v1], y_norm[v0:v1], max_samples=args.phase_samples,
+)
+bound_rate, bound_excess = boundedness_metrics(
+    preds[v0:v1], truth[v0:v1], relative_pad=args.bound_pad,
+)
+divergence_pred, divergence_pred_pairs = finite_time_divergence_rate(
+    preds_norm[v0:v1], dt, max_points=args.divergence_points,
+    fit_steps=args.divergence_steps,
+)
+divergence_true, divergence_true_pairs = finite_time_divergence_rate(
+    y_norm[v0:v1], dt, max_points=args.divergence_points,
+    fit_steps=args.divergence_steps,
+)
 
 # Burst stats (Hindmarsh--Rose only)
 burst_pred = burst_stats(preds[v0:v1, 0], dt)
@@ -227,6 +262,14 @@ print(f"  Wasserstein-1 = {wd_mean:.5f}  (per-component: "
       f"{', '.join(f'{w:.4f}' for w in wd_per)})")
 print(f"  sym-KL        = {kl_mean:.5f}  (per-component: "
       f"{', '.join(f'{k:.4f}' for k in kl_per)})")
+print(f"  ACF-L1        = {acf_mean:.5f}  (per-component: "
+      f"{', '.join(f'{a:.4f}' for a in acf_per)})")
+print(f"  dom-freq err  = {np.nanmean(dominant_error):.5f} Hz  (per-component: "
+      f"{', '.join(f'{f:.4f}' for f in dominant_error)})")
+print(f"  phase-Chamfer = {phase_chamfer:.5f}")
+print(f"  out-of-bounds = {bound_rate:.2%}  mean-excess={bound_excess:.5f}")
+print(f"  finite-time divergence rate: pred={divergence_pred:.5f}, "
+      f"truth={divergence_true:.5f}")
 if system == "hindmarsh_rose":
     print(f"  burst dur     pred={burst_pred[0]:.3f}  truth={burst_true[0]:.3f}")
     print(f"  ISI           pred={burst_pred[1]:.3f}  truth={burst_true[1]:.3f}")
@@ -260,10 +303,11 @@ out = args.ckpt.replace(".pt", "_val.png")
 plt.savefig(out, dpi=120); print(f"saved -> {out}")
 
 # === Plots: phase portrait + training curve + PSD =========================
-fig2 = plt.figure(figsize=(15, 4))
-ax_ph    = fig2.add_subplot(1, 3, 1)
-ax_hist  = fig2.add_subplot(1, 3, 2)
-ax_psd   = fig2.add_subplot(1, 3, 3)
+fig2 = plt.figure(figsize=(20, 4))
+ax_ph    = fig2.add_subplot(1, 4, 1)
+ax_hist  = fig2.add_subplot(1, 4, 2)
+ax_psd   = fig2.add_subplot(1, 4, 3)
+ax_acf   = fig2.add_subplot(1, 4, 4)
 
 s = min(split_idx, n_steps + 1)
 ax_ph.plot(truth[:s, 0],  truth[:s, 1],  lw=0.5, color="C0", label="truth (train)")
@@ -289,6 +333,16 @@ ax_psd.semilogy(freqs, psd_p + 1e-12, label="pred", ls="--")
 ax_psd.set_xlabel("frequency"); ax_psd.set_ylabel("|X(f)|^2")
 ax_psd.set_title(f"PSD {var_names[0]}  (L1={spec_d:.3f})")
 ax_psd.legend(fontsize=8)
+
+# Autocorrelation on validation region (component 0)
+acf_truth = autocorrelation_1d(y_norm[v0:v1, 0], args.acf_lags)
+acf_pred = autocorrelation_1d(preds_norm[v0:v1, 0], args.acf_lags)
+lags = np.arange(min(len(acf_truth), len(acf_pred))) * dt
+ax_acf.plot(lags, acf_truth[:len(lags)], label="truth")
+ax_acf.plot(lags, acf_pred[:len(lags)], label="pred", ls="--")
+ax_acf.set_xlabel("lag"); ax_acf.set_ylabel("ACF")
+ax_acf.set_title(f"autocorrelation {var_names[0]}")
+ax_acf.legend(fontsize=8)
 
 plt.tight_layout()
 out2 = args.ckpt.replace(".pt", "_phase.png")
@@ -370,6 +424,38 @@ metrics = {
         "mean":      float(kl_mean),
         "per_component": _to_py(kl_per),
         "bins":      int(args.bins),
+    },
+    "temporal_structure": {
+        "autocorrelation_l1": {
+            "mean": float(acf_mean),
+            "per_component": _to_py(acf_per),
+            "max_lags": int(args.acf_lags),
+        },
+        "dominant_frequency_hz": {
+            "pred": _to_py(dominant_pred),
+            "truth": _to_py(dominant_true),
+            "abs_error_mean": float(np.nanmean(dominant_error)),
+            "abs_error_per_component": _to_py(dominant_error),
+        },
+    },
+    "attractor_geometry": {
+        "phase_space_chamfer": float(phase_chamfer),
+        "max_samples": int(args.phase_samples),
+    },
+    "boundedness": {
+        "relative_truth_range_pad": float(args.bound_pad),
+        "outside_truth_envelope_rate": float(bound_rate),
+        "mean_excess": float(bound_excess),
+    },
+    "finite_time_divergence": {
+        "pred_rate": float(divergence_pred),
+        "truth_rate": float(divergence_true),
+        "abs_error": float(abs(divergence_pred - divergence_true)),
+        "pred_pairs": int(divergence_pred_pairs),
+        "truth_pairs": int(divergence_true_pairs),
+        "fit_steps": int(args.divergence_steps),
+        "max_points": int(args.divergence_points),
+        "note": "Local neighbour-separation proxy, not a formal Lyapunov exponent.",
     },
     "burst_stats": {
         "pred_dur":  float(burst_pred[0]),

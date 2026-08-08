@@ -4,28 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# === RK4 integrator (copy from models.py for self-containment) ============
-def rk4_integrate(func, y0, t_grid):
-    """Fixed-step RK4 over an arbitrary 1-D time grid.
-
-    func(t, y) : (B, D) -> (B, D)
-    y0         : (B, D)
-    t_grid     : (T+1,)
-    returns traj: (T+1, B, D)
-    """
-    ys = [y0]
-    y = y0
-    for i in range(t_grid.numel() - 1):
-        t0 = t_grid[i]
-        h = t_grid[i + 1] - t0
-        k1 = func(t0,           y)
-        k2 = func(t0 + 0.5 * h, y + 0.5 * h * k1)
-        k3 = func(t0 + 0.5 * h, y + 0.5 * h * k2)
-        k4 = func(t0 + h,       y + h * k3)
-        y = y + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        ys.append(y)
-    return torch.stack(ys, dim=0)
+from src.dynsys.models.integrators import rk4_integrate
 
 
 # === Building-block MLPs ===================================================

@@ -1,3 +1,6 @@
 .venv
 runs
+checkpoints
+logs
+.pytest_cache
 .DS_Store

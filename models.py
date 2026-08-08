@@ -1,29 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchdiffeq import odeint
 
-
-def rk4_integrate(func, y0, t_grid):
-    """Fixed-step RK4 over an arbitrary 1-D time grid.
-
-    func(t, y)  : (B, D) -> (B, D)
-    y0          : (B, D)
-    t_grid      : (T+1,)
-    returns traj: (T+1, B, D)
-    """
-    ys = [y0]
-    y = y0
-    for i in range(t_grid.numel() - 1):
-        t0 = t_grid[i]
-        h = t_grid[i + 1] - t0
-        k1 = func(t0,           y)
-        k2 = func(t0 + 0.5 * h, y + 0.5 * h * k1)
-        k3 = func(t0 + 0.5 * h, y + 0.5 * h * k2)
-        k4 = func(t0 + h,       y + h * k3)
-        y = y + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        ys.append(y)
-    return torch.stack(ys, dim=0)
+from src.dynsys.models.integrators import rk4_integrate
 
 class ODEFunc(nn.Module):
     """Plain MLP vector field used by NODE, ANODE, WP-NODE."""
@@ -39,8 +18,8 @@ class ODEFunc(nn.Module):
         return self.net(y)
 
 
-class CSODEFunc(nn.Module):
-    """Continuously-Stable ODE function: f(y) = -softplus(gamma) * y + MLP(y).
+class LegacyDissipativeODEFunc(nn.Module):
+    """Archived pre-refactor stable ODE vector field; not publicly registered.
 
     The contraction term -softplus(gamma) * y guarantees that the linear part
     of the vector field is dissipative (negative-definite) which keeps long-
@@ -272,11 +251,11 @@ class ANODE(nn.Module):
         return traj[1:, :, :self.dim].permute(1, 0, 2)
 
 
-class CSODE(nn.Module):
-    """Continuously-Stable ODE."""
+class LegacyDissipativeODE(nn.Module):
+    """Archived wrapper for the pre-refactor stable ODE."""
     def __init__(self, dim, hidden, gamma_init=0.1):
         super().__init__()
-        self.func = CSODEFunc(dim, hidden, gamma_init=gamma_init)
+        self.func = LegacyDissipativeODEFunc(dim, hidden, gamma_init=gamma_init)
 
     def forward(self, y0, t_grid):
         traj = rk4_integrate(self.func, y0, t_grid)
@@ -476,41 +455,21 @@ def build_model(model_type, dim, hidden, seq_len, aug=2, gamma_init=0.1, alpha_i
                 init_decay=0.05, skew_scale=1.0, sym_scale=0.1,
                 hidden_corr=32, hidden_ctrl=32, hidden_enc=32,
                 resnode_solver='dopri5'):
-    if model_type == "node":
-        return NeuralODE(dim, hidden)
-    if model_type == "anode":
-        return ANODE(dim, hidden, aug=aug)
-    if model_type == "csode":
-        return CSODE(dim, hidden, gamma_init=gamma_init)
-    if model_type == "hnode":
-        return HNODE(dim, hidden, aug=aug if aug > 0 else 4,
-                     gamma_init=gamma_init, alpha_init=alpha_init)
-    if model_type == "rnode":
-        return RNODE(dim, hidden, aug=aug if aug > 0 else 4,
-                     gamma_init=gamma_init, alpha_init=alpha_init)
-    if model_type == "snode":
-        return SNODE(dim, hidden, aug=aug if aug > 0 else 4,
-                     gamma_init=gamma_init, alpha_init=alpha_init)
-    if model_type == "lnode":
-        return LNODE(dim, hidden, aug=aug if aug > 0 else 4,
-                     gamma_init=gamma_init, alpha_init=alpha_init)
-    if model_type == "fnode":
-        return FNODE(dim, hidden, aug=aug if aug > 0 else 4,
-                     gamma_init=gamma_init, alpha_init=alpha_init)
-    if model_type == "fnode_v2":
-        return FNODEV2(dim, hidden, aug=aug if aug > 0 else 4,
-                       gamma_init=-4.0, alpha_init=alpha_init)
-
-
-    if model_type == "mlp":
-        return MLP(dim, hidden, seq_len)
-    if model_type == "rnn":
-        return RNN(dim, hidden, seq_len)
-    raise ValueError(f"Unknown model_type: {model_type}")
+    # Compatibility shim: new code imports the registry directly.
+    from src.dynsys.models.registry import build_model as _build_model
+    return _build_model(
+        model_type, dim, hidden, seq_len, aug=aug, gamma_init=gamma_init,
+        alpha_init=alpha_init, n_freqs=n_freqs, base_freq=base_freq,
+        use_control=use_control, use_nonlinear=use_nonlinear,
+        encode_aug=encode_aug, init_decay=init_decay, skew_scale=skew_scale,
+        sym_scale=sym_scale, hidden_corr=hidden_corr, hidden_ctrl=hidden_ctrl,
+        hidden_enc=hidden_enc, resnode_solver=resnode_solver,
+    )
 
 
 # Models that support .regularization(y_sample) for Jacobian/kinetic penalties
-REGULARIZED_MODELS = {"wpnode", "hnode", "tnode", "rnode", "snode", "lnode", "fnode", "fnode_v2", "resnode"}
-ODE_MODELS = {"node", "anode", "csode", "hnode",
-              "rnode", "snode", "lnode", "fnode", "fnode_v2", "resnode"}
+# Kept for compatibility with code importing the legacy module directly.
+from src.dynsys.models.csode import CSODE, CSODEFunc
 
+REGULARIZED_MODELS = {"csode", "fnode"}
+ODE_MODELS = {"node", "anode", "csode", "fnode"}
